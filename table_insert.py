@@ -24,13 +24,18 @@ def start_table_insert(count):
         wealth = random.uniform(1.057414979, 2233.228433)
         income_investment = random.randint(0, 1)
         accumulation_investment = random.randint(0, 1)
+        client_id = random.randint(1, 100)
 
         query = f"""INSERT INTO Needs (ID, Age, Gender, FamilyMembers, FinancialEducation, 
-                                        Income, Wealth, IncomeInvestment, AccumulationInvestment)
+                                        Income, Wealth, IncomeInvestment, AccumulationInvestment, ClientId)
                     VALUES (
                     (SELECT MAX(ID)+1 FROM Needs),
                     {age}, {gender}, {family_members}, {financial_education},
-                    {income}, {wealth}, {income_investment}, {accumulation_investment}
+                    {income}, {wealth}, {income_investment}, {accumulation_investment},
+                    {client_id}
                 );"""
 
         cursor.execute(query)
+
+    cursor.close()
+    conn.close()
