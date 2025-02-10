@@ -5,46 +5,62 @@ import requests
 import pandas as pd
 import numpy as np
 import ray
+from ray.util import ActorPool
 from ray.util.queue import Queue
 from table_insert import start_table_insert
 
+NUM_WORKERS = 5
+NUM_MONITORS = 3
+NUM_PREDICTORS = 2
+NUM_ALLOWED_REQUESTS = 5
 
 @ray.remote(num_cpus=1, resources={"monitor_node":1})
 class Monitor:
-    def __init__(self, num_workers, workers):
+    def __init__(self, worker_pool):
         self.task_queue = Queue()
-        self.worker_ids = [i for i in range(num_workers)]
-        self.workers = workers
-        self.record = pd.DataFrame(columns=['Worker', 'ClientId', 'Count'])
-        self.allowed_requests = 5
+        self.worker_ids = [i for i in range(NUM_WORKERS)]
+        self.worker_pool = worker_pool
+        self.record = pd.DataFrame(columns=['ClientId', 'Count'])
+        self.allowed_requests = NUM_ALLOWED_REQUESTS
 
     def push(self, row_id, client_id):
+        '''
+        Pushes the prediction request into its local queue
+        '''
         self.task_queue.put(row_id)
         self.check_record(client_id)
 
     def check_record(self, client_id):
-        # Assign client to worker
-        assigned_worker_id = client_id % len(self.worker_ids)
-
+        '''
+        Checks into its local record if the client has enough requests available
+        '''
         # Check if the row exists
         existing_row = self.record[self.record['ClientId'] == client_id]
 
         if existing_row.empty:
             # Row doesn't exist, add a new one with Count = 1
-            new_row = {'Worker': assigned_worker_id, 'ClientId': client_id, 'Count': 1}
+            new_row = {'ClientId': client_id, 'Count': 1}
             self.record = pd.concat([self.record, pd.DataFrame([new_row])], ignore_index=True)
-            self.workers[assigned_worker_id].work.remote(self.task_queue.get())
+
+            if self.worker_pool.has_next():
+                self.worker_pool.get_next()
+
+            self.worker_pool.submit(lambda a, v: a.work.remote(v), self.task_queue.get())
 
         else:
-            # Row exists, increment the Count
+            # Row exists, increment Count
             if self.record.at[existing_row.index[0], 'Count'] < self.allowed_requests:
                 index = existing_row.index[0]  # Index of the row
                 self.record.at[index, 'Count'] += 1
-                self.workers[assigned_worker_id].work.remote(self.task_queue.get())
+
+                if self.worker_pool.has_next():
+                    self.worker_pool.get_next()
+
+                self.worker_pool.submit(lambda a, v: a.work.remote(v), self.task_queue.get())
 
             else:
                 self.task_queue.get()
-                #print(f"Client {client_id} has exceeded allowed requests")
+                # print(f"Client {client_id} has exceeded allowed requests")
 
 
 @ray.remote(num_cpus=1, resources={"workers_node":1})
@@ -72,13 +88,16 @@ class Worker:
         return pd.DataFrame(tuples_list, columns=self.column_names)
 
     def data_prep(self, data):
+        # Compute FinancialStatus
         data['FinancialStatus'] = data['FinancialEducation'] * np.log(data['Wealth'])
         financial_status = data['FinancialStatus'].iloc[0]
 
+        # Drop target and unnecessary columns
         data = data.drop('ID', axis=1)
         data = data.drop('RiskPropensity', axis=1)
         data = data.drop('ClientId', axis=1)
 
+        # Data prep
         data['Wealth'] = (data['Wealth'] ** self.fitted_lambda_wealth - 1) / self.fitted_lambda_wealth
         data['Income'] = (data['Income'] ** self.fitted_lambda_income - 1) / self.fitted_lambda_income
 
@@ -140,7 +159,6 @@ if __name__ == '__main__':
         "port": "5432"
     }
 
-    model_path = 'deep_model.h5'
     scaler_path = 'deep_scaler.pkl'
     lambdas_wealth_income = [0.1336735055366279, 0.3026418664067109]
     column_names = [
@@ -152,18 +170,16 @@ if __name__ == '__main__':
     # Initialize Ray
     ray.init()
 
-    # Workers pool
-    num_workers = 6
-
-    # Workers pool
+    # Worker pool init
     workers = [Worker.remote(db_config, scaler_path,
                              lambdas_wealth_income, column_names)
-               for _ in range(num_workers)]
+               for _ in range(NUM_WORKERS)]
+    worker_pool = ActorPool(workers)
 
-    # Monitor init
-    monitor = Monitor.remote(num_workers, workers)
+    # Monitors init
+    monitors = [Monitor.remote(worker_pool) for _ in range(NUM_MONITORS)]
 
-    # DB config
+    # DB connection
     conn = psycopg2.connect(**db_config)
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cursor = conn.cursor()
@@ -171,11 +187,14 @@ if __name__ == '__main__':
     # Listen on table_insert channel
     cursor.execute("LISTEN table_insert;")
     print("Main listener is active and waiting for events...")
-    ### the following block is for testing ###
+
+    ### --- TEST --- ###
     query = "delete from needs where id > 5000"
     cursor.execute(query)
+    # Insert 1000 tuples into DB for testing
     start_table_insert(1000)
-    ### the previous block is for testing ###
+    ### --- TEST --- ###
+
     try:
         while True:
             # Wait for events
@@ -184,11 +203,16 @@ if __name__ == '__main__':
 
                 while conn.notifies:
                     notify = conn.notifies.pop(0)
+
                     data = dict(item.split('=') for item in notify.payload.split(','))
                     row_id = int(data['ID'])
                     client_id = int(data['ClientID'])
+
                     print(f"Received Notification: ID={row_id}, ClientID={client_id}")
-                    monitor.push.remote(row_id, client_id)
+
+                    # Dispatch client to assigned monitor
+                    assigned_monitor = client_id % NUM_MONITORS
+                    monitors[assigned_monitor].push.remote(row_id, client_id)
 
     except KeyboardInterrupt:
         print("Exiting...")
