@@ -1,3 +1,5 @@
+import json
+
 import joblib
 import psycopg2
 import select
@@ -12,7 +14,7 @@ from table_insert import start_table_insert
 NUM_WORKERS = 5
 NUM_MONITORS = 3
 NUM_PREDICTORS = 2
-NUM_ALLOWED_REQUESTS = 5
+NUM_ALLOWED_REQUESTS = 50000
 
 @ray.remote(num_cpus=1, resources={"monitor_node":1})
 class Monitor:
@@ -93,7 +95,7 @@ class Worker:
         financial_status = data['FinancialStatus'].iloc[0]
 
         # Drop target and unnecessary columns
-        data = data.drop('ID', axis=1)
+        data = data.drop('Id', axis=1)
         data = data.drop('RiskPropensity', axis=1)
         data = data.drop('ClientId', axis=1)
 
@@ -126,8 +128,8 @@ class Worker:
 
         # Update DB: FinancialStatus and RiskPropensity
         query = f"""UPDATE needs 
-                    SET riskpropensity  = {prediction},
-                        financialstatus = {financial_status}
+                    SET risk_propensity  = {prediction},
+                        financial_status = {financial_status}
                     WHERE id = {row_id}"""
         self.cursor.execute(query)
         print(f"Updated for ID={row_id} RiskPropensity={prediction} and FinancialStatus={financial_status}")
@@ -154,7 +156,6 @@ if __name__ == '__main__':
     db_config = {
         "dbname": "postgres",
         "user": "postgres",
-        "password": "tony",
         "host": "localhost",
         "port": "5432"
     }
@@ -162,7 +163,7 @@ if __name__ == '__main__':
     scaler_path = 'deep_scaler.pkl'
     lambdas_wealth_income = [0.1336735055366279, 0.3026418664067109]
     column_names = [
-        "ID", "Age", "Gender", "FamilyMembers", "FinancialEducation",
+        "Id", "Age", "Gender", "FamilyMembers", "FinancialEducation",
         "RiskPropensity", "Income", "Wealth", "IncomeInvestment",
         "AccumulationInvestment", "FinancialStatus", "ClientId"
     ]
@@ -189,10 +190,10 @@ if __name__ == '__main__':
     print("Main listener is active and waiting for events...")
 
     ### --- TEST --- ###
-    query = "delete from needs where id > 5000"
-    cursor.execute(query)
+    #query = "delete from needs where id > 5000"
+    #cursor.execute(query)
     # Insert 1000 tuples into DB for testing
-    start_table_insert(1000)
+    #start_table_insert(1000)
     ### --- TEST --- ###
 
     try:
@@ -204,9 +205,9 @@ if __name__ == '__main__':
                 while conn.notifies:
                     notify = conn.notifies.pop(0)
 
-                    data = dict(item.split('=') for item in notify.payload.split(','))
-                    row_id = int(data['ID'])
-                    client_id = int(data['ClientID'])
+                    data = json.loads(notify.payload)
+                    row_id = int(data['id'])
+                    client_id = int(data['client_id'])
 
                     print(f"Received Notification: ID={row_id}, ClientID={client_id}")
 
